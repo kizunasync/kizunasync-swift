@@ -1,36 +1,38 @@
 # Kizuna Sync for Swift
 
-`Ksync` is the Swift app client for [Kizuna Sync](https://kizunasync.com): offline reads and writes on local SQLite, an outbox that syncs through your Supabase project, and typed access to the Rust engine through UniFFI.
+`KizunaSync` is the Swift app client for [Kizuna Sync](https://kizunasync.com): offline reads and writes on local SQLite, an outbox that syncs through your Supabase project, and typed access to the Rust engine through UniFFI.
 
 ## Install
 
-In Xcode choose File → Add Package Dependencies and enter `https://github.com/kizunasync/ksync-swift`, or declare the dependency in `Package.swift`:
+In Xcode choose File → Add Package Dependencies and enter `https://github.com/kizunasync/kizunasync-swift`, or declare the dependency in `Package.swift`:
 
 ```swift
 dependencies: [
-  .package(url: "https://github.com/kizunasync/ksync-swift", from: "0.1.0"),
+  .package(url: "https://github.com/kizunasync/kizunasync-swift", exact: "0.2.6-alpha.3"),
 ],
 targets: [
   .target(
     name: "App",
-    dependencies: [.product(name: "Ksync", package: "ksync-swift")]
+    dependencies: [.product(name: "KizunaSync", package: "kizunasync-swift")]
   ),
 ]
 ```
 
 ```swift
-import Ksync
+import KizunaSync
 ```
 
-Platforms: iOS 16 and macOS 13 or later. The package links the prebuilt `KsyncFfi` XCFramework, so the app project needs no Rust toolchain.
+Platforms: iOS 16 and macOS 13 or later. The package links the prebuilt `KizunaSyncFfi` XCFramework, so the app project needs no Rust toolchain.
+
+Apps use the `KizunaSync` product. `KizunaSyncEngine` exposes only the engine binary, for the React Native module `@kizunasync/rn-uniffi`.
 
 ## What is inside
 
 | Path | Contents |
 |---|---|
-| `Sources/Ksync` | `KsyncClient`, `KsyncScheduler`, and their configuration types |
-| `Sources/KsyncFfi` | UniFFI-generated Swift over the Rust engine |
-| `KsyncFfiRust` | Binary target: `KsyncFfi.xcframework.zip` from the matching `kizunasync/kizunasync` release, pinned by checksum |
+| `Sources/KizunaSync` | `KizunaSyncClient`, `KizunaSyncScheduler`, and their configuration types |
+| `Sources/KizunaSyncFfi` | UniFFI-generated Swift over the Rust engine |
+| `KizunaSyncFfiRust` | Binary target: `KizunaSyncFfi.xcframework.zip` from the matching `kizunasync/kizunasync` release, pinned by checksum |
 
 ## Documentation and source
 

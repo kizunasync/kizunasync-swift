@@ -7,8 +7,8 @@ import Foundation
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
 // this module. This is a bit of light hackery to work with both.
-#if canImport(ksync_ffiFFI)
-import ksync_ffiFFI
+#if canImport(kizunasync_ffiFFI)
+import kizunasync_ffiFFI
 #endif
 
 fileprivate extension RustBuffer {
@@ -25,13 +25,13 @@ fileprivate extension RustBuffer {
     }
 
     static func from(_ ptr: UnsafeBufferPointer<UInt8>) -> RustBuffer {
-        try! rustCall { ffi_ksync_ffi_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
+        try! rustCall { ffi_kizunasync_ffi_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
     }
 
     // Frees the buffer in place.
     // The buffer must not be used after this is called.
     func deallocate() {
-        try! rustCall { ffi_ksync_ffi_rustbuffer_free(self, $0) }
+        try! rustCall { ffi_kizunasync_ffi_rustbuffer_free(self, $0) }
     }
 }
 
@@ -281,7 +281,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureKsyncFfiInitialized()
+    uniffiEnsureKizunasyncFfiInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -547,11 +547,15 @@ fileprivate struct FfiConverterString: FfiConverter {
  * Per-ref attachment progress. Distinct from [`EventObserver`]: a download's
  * percent is not a global `LOCAL_CHANGED`.
  *
- * Same reentrancy contract as [`EventObserver`]: `on_status` is synchronous and
- * must not call back into the engine.
+ * `on_status` runs on the handle's delivery thread, in emission order with
+ * the engine events, so it may call back into the handle. A failing listener
+ * drops its own status, and the statuses after it still arrive.
  */
 public protocol AttachmentListener: AnyObject, Sendable {
     
+    /**
+     * Receive the reference's current status.
+     */
     func onStatus(status: FfiAttachmentStatus) 
     
 }
@@ -559,8 +563,9 @@ public protocol AttachmentListener: AnyObject, Sendable {
  * Per-ref attachment progress. Distinct from [`EventObserver`]: a download's
  * percent is not a global `LOCAL_CHANGED`.
  *
- * Same reentrancy contract as [`EventObserver`]: `on_status` is synchronous and
- * must not call back into the engine.
+ * `on_status` runs on the handle's delivery thread, in emission order with
+ * the engine events, so it may call back into the handle. A failing listener
+ * drops its own status, and the statuses after it still arrive.
  */
 open class AttachmentListenerImpl: AttachmentListener, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -599,7 +604,7 @@ open class AttachmentListenerImpl: AttachmentListener, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_ksync_ffi_fn_clone_attachmentlistener(self.handle, $0) }
+        return try! rustCall { uniffi_kizunasync_ffi_fn_clone_attachmentlistener(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -609,14 +614,17 @@ open class AttachmentListenerImpl: AttachmentListener, @unchecked Sendable {
             return
         }
 
-        try! rustCall { uniffi_ksync_ffi_fn_free_attachmentlistener(handle, $0) }
+        try! rustCall { uniffi_kizunasync_ffi_fn_free_attachmentlistener(handle, $0) }
     }
 
     
 
     
+    /**
+     * Receive the reference's current status.
+     */
 open func onStatus(status: FfiAttachmentStatus)  {try! rustCall() {
-    uniffi_ksync_ffi_fn_method_attachmentlistener_on_status(
+    uniffi_kizunasync_ffi_fn_method_attachmentlistener_on_status(
             self.uniffiCloneHandle(),
         FfiConverterTypeFfiAttachmentStatus_lower(status),$0
     )
@@ -691,7 +699,7 @@ fileprivate struct UniffiCallbackInterfaceAttachmentListener {
 }
 
 private func uniffiCallbackInitAttachmentListener() {
-    uniffi_ksync_ffi_fn_init_callback_vtable_attachmentlistener(UniffiCallbackInterfaceAttachmentListener.vtablePtr)
+    uniffi_kizunasync_ffi_fn_init_callback_vtable_attachmentlistener(UniffiCallbackInterfaceAttachmentListener.vtablePtr)
 }
 
 #if swift(>=5.8)
@@ -758,14 +766,18 @@ public func FfiConverterTypeAttachmentListener_lower(_ value: AttachmentListener
  * Synchronous host observer. `UniFFI` 0.31 + Swift 6 cannot export async foreign
  * traits (`#SendingClosureRisksDataRace`).
  *
- * `on_event` runs on the thread that produced the event, in emission order —
- * events emitted during `apply` / `sync` run while the engine handle's lock is
- * held, so calling back into the engine from the observer deadlocks. Hand the
- * event to another queue or thread (`DispatchQueue`, a `Flow`, an actor) and
- * return.
+ * `on_event` runs on the handle's delivery thread, one event at a time and in
+ * emission order, never on the thread that made the call. It may call back
+ * into the handle. A slow observer delays the events and statuses queued
+ * after it, so an observer with real work hands the event to its own queue
+ * and returns. A failing observer drops its own event, and the events after it
+ * still arrive.
  */
 public protocol EventObserver: AnyObject, Sendable {
     
+    /**
+     * Receive one engine event.
+     */
     func onEvent(event: FfiEngineEvent) 
     
 }
@@ -773,11 +785,12 @@ public protocol EventObserver: AnyObject, Sendable {
  * Synchronous host observer. `UniFFI` 0.31 + Swift 6 cannot export async foreign
  * traits (`#SendingClosureRisksDataRace`).
  *
- * `on_event` runs on the thread that produced the event, in emission order —
- * events emitted during `apply` / `sync` run while the engine handle's lock is
- * held, so calling back into the engine from the observer deadlocks. Hand the
- * event to another queue or thread (`DispatchQueue`, a `Flow`, an actor) and
- * return.
+ * `on_event` runs on the handle's delivery thread, one event at a time and in
+ * emission order, never on the thread that made the call. It may call back
+ * into the handle. A slow observer delays the events and statuses queued
+ * after it, so an observer with real work hands the event to its own queue
+ * and returns. A failing observer drops its own event, and the events after it
+ * still arrive.
  */
 open class EventObserverImpl: EventObserver, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -816,7 +829,7 @@ open class EventObserverImpl: EventObserver, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_ksync_ffi_fn_clone_eventobserver(self.handle, $0) }
+        return try! rustCall { uniffi_kizunasync_ffi_fn_clone_eventobserver(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -826,14 +839,17 @@ open class EventObserverImpl: EventObserver, @unchecked Sendable {
             return
         }
 
-        try! rustCall { uniffi_ksync_ffi_fn_free_eventobserver(handle, $0) }
+        try! rustCall { uniffi_kizunasync_ffi_fn_free_eventobserver(handle, $0) }
     }
 
     
 
     
+    /**
+     * Receive one engine event.
+     */
 open func onEvent(event: FfiEngineEvent)  {try! rustCall() {
-    uniffi_ksync_ffi_fn_method_eventobserver_on_event(
+    uniffi_kizunasync_ffi_fn_method_eventobserver_on_event(
             self.uniffiCloneHandle(),
         FfiConverterTypeFfiEngineEvent_lower(event),$0
     )
@@ -908,7 +924,7 @@ fileprivate struct UniffiCallbackInterfaceEventObserver {
 }
 
 private func uniffiCallbackInitEventObserver() {
-    uniffi_ksync_ffi_fn_init_callback_vtable_eventobserver(UniffiCallbackInterfaceEventObserver.vtablePtr)
+    uniffi_kizunasync_ffi_fn_init_callback_vtable_eventobserver(UniffiCallbackInterfaceEventObserver.vtablePtr)
 }
 
 #if swift(>=5.8)
@@ -974,83 +990,343 @@ public func FfiConverterTypeEventObserver_lower(_ value: EventObserver) -> UInt6
 /**
  * Instance-scoped engine handle for Swift/Kotlin (`UniFFI` object).
  */
-public protocol KsyncEngineProtocol: AnyObject, Sendable {
-    
-    func apply(mutationJson: String) throws 
-    
-    func applyWhere(table: String, op: String, filtersJson: String, columnsJson: String, transformsJson: String, preconditionJson: String) throws  -> [String]
+public protocol KizunaSyncEngineProtocol: AnyObject, Sendable {
     
     /**
-     * One JSON-RPC surface matching `ksync-napi` (`apply`, `sync`, `pull_once`,
+     * Apply one local mutation and queue it for the next push.
+     *
+     * A mutation against a table whose `conflict_mode` is `hlc` carries the
+     * origin HLC the server resolves the column by: the one the caller put in
+     * `mutation_json`, or a freshly minted stamp. An arrival-mode table carries
+     * none.
+     *
+     * # Errors
+     *
+     * `UNKNOWN_OP` for an op outside insert/update/delete, and whatever the
+     * engine reports for the write itself.
+     */
+    func apply(mutationJson: String) throws 
+    
+    /**
+     * Apply one op to every local row the filters select, and return their
+     * primary keys, or with `returning` the rows they name, one JSON object
+     * per element. Empty strings stand for absent `transforms`,
+     * `precondition`, and options.
+     *
+     * `options_json` is `{"max_affected": n, "returning": bool, "cardinality":
+     * "single" | "maybeSingle"}`, every key optional. A write past
+     * `max_affected`, or one whose match count breaks `cardinality`, writes
+     * nothing.
+     *
+     * # Errors
+     *
+     * `UNKNOWN_OP` for an op outside insert/update/delete, `JSON` for a
+     * malformed argument or an unknown option, `LOCAL_CONSTRAINT` for a broken
+     * cap or cardinality, and whatever the engine reports for the write.
+     */
+    func applyWhere(table: String, op: String, filtersJson: String, columnsJson: String, transformsJson: String, preconditionJson: String, optionsJson: String) throws  -> [String]
+    
+    /**
+     * One JSON-RPC surface matching `kizunasync-napi` (`apply`, `sync`, `pull_once`,
      * attachment rows, …). Envelope `{ok, value}` / `{ok:false, error}`.
      *
      * `params_json` may carry the embedder's clock (`now` / `now_ms`); it is
-     * pinned for this dispatch only, so both engines stamp the same values from
+     * pinned for this dispatch only, so every bridge stamps the same values from
      * the same request and the typed methods keep stamping with the system
      * clock.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine. A method that fails
+     * answers inside the envelope instead, as `ok:false`.
      */
     func call(method: String, paramsJson: String) throws  -> String
     
+    /**
+     * [`Self::call`] without blocking the caller: the future resolves once the
+     * engine thread answers, so a host that must keep its thread free (the
+     * React Native JavaScript thread) awaits it instead.
+     *
+     * # Errors
+     *
+     * The same as [`Self::call`].
+     */
+    func callAsync(method: String, paramsJson: String) async throws  -> String
+    
+    /**
+     * The current pull cursor and whether the engine is holding writes back,
+     * with the reason it is.
+     *
+     * # Errors
+     *
+     * The store's code when the cursor cannot be read.
+     */
     func checkpoint() throws  -> FfiCheckpoint
     
     /**
-     * Create / replace this handle's engine from `EngineConfig` JSON.
+     * Create or replace this handle's engine from `EngineConfig` JSON.
+     *
+     * Replacing an engine waits for the calls it already accepted, then closes
+     * it; its subscriptions and watchers end with it.
+     *
+     * # Errors
+     *
+     * `CONFIG_INVALID` when the JSON, the `remote` object, a table's
+     * `conflict_mode` or the attachment root is refused, the store's own code
+     * when the database cannot be opened, and `ENGINE_UNAVAILABLE` when the
+     * runtime or a thread will not start.
      */
     func create(configJson: String) throws 
     
+    /**
+     * Dismiss one journal entry. `false` means no entry carries that mutation id.
+     *
+     * # Errors
+     *
+     * The store's code when the journal cannot be written.
+     */
     func dismissRejection(mutationId: String) throws  -> Bool
     
+    /**
+     * Import a host file into the attachment sandbox, queue its upload, and
+     * return the Storage reference the column now holds. The reference's
+     * watchers then hear its new status on the delivery thread.
+     *
+     * # Errors
+     *
+     * `ATTACHMENT_PORTS_MISSING` when the handle was created without
+     * `attachment_root`, `ATTACHMENT_ROW_GONE` or `ATTACHMENT_OWNER_MISSING`
+     * when the row cannot carry the reference, and the transfer code when the
+     * bytes cannot be read.
+     */
     func fromFile(table: String, column: String, pk: String, sourcePath: String, mediaType: String?) throws  -> FfiFromFileResult
     
+    /**
+     * The current status of `reference`, or `None` when no attachment row
+     * carries it.
+     *
+     * # Errors
+     *
+     * The store's code when the row cannot be read.
+     */
     func getStatus(reference: String) throws  -> FfiAttachmentStatus?
     
+    /**
+     * Devtools snapshot of the local command queue: the queued page, the depth,
+     * the last mutation id, the cursor and the client identity. It is the payload
+     * `call("inspect", "{}")` answers with, unwrapped from the envelope, because
+     * the engine's own `inspect` is the one owner of those five fields.
+     *
+     * # Errors
+     *
+     * The code the engine reported inside the envelope, and `JSON` when the
+     * envelope itself cannot be read.
+     */
+    func inspect() throws  -> String
+    
+    /**
+     * How many mutations are waiting to be pushed. Saturates at [`u32::MAX`].
+     *
+     * # Errors
+     *
+     * The store's code when the count cannot be read.
+     */
     func outboxDepth() throws  -> UInt32
     
+    /**
+     * Run one pull round without pushing.
+     *
+     * # Errors
+     *
+     * Whatever the remote reports. A transport failure arrives as
+     * `PERMANENT_TRANSPORT` or `REMOTE`, with the server's message in `msg`.
+     */
     func pullOnce() throws 
     
+    /**
+     * Push one outbox batch without pulling.
+     *
+     * # Errors
+     *
+     * Whatever the remote reports. A transport failure arrives as
+     * `PERMANENT_TRANSPORT` or `REMOTE`, with the server's message in `msg`.
+     */
     func pushOnce() throws 
     
     /**
-     * Returns query result JSON (array for many, object/null for single/maybeSingle).
+     * Run one query against the local store and return its result as JSON: an
+     * array for `many`, an object or `null` for `single` and `maybeSingle`.
+     *
+     * # Errors
+     *
+     * `LOCAL_UNSUPPORTED` for a plan the local evaluator cannot run,
+     * `LOCAL_CONSTRAINT` when a cardinality is violated, and the store's code
+     * when the read itself fails.
      */
     func query(reqJson: String) throws  -> String
     
+    /**
+     * [`Self::query`] with the table and the plan as separate arguments, for
+     * hosts that build the plan and the table name apart. An empty `plan_json`
+     * is the empty plan.
+     *
+     * # Errors
+     *
+     * The same as [`Self::query`], plus `JSON` for a malformed plan.
+     */
     func queryTable(table: String, planJson: String) throws  -> String
     
+    /**
+     * The rejection journal, newest first. `include_dismissed` also returns the
+     * entries the host already dismissed.
+     *
+     * # Errors
+     *
+     * The store's code when the journal cannot be read.
+     */
     func rejections(includeDismissed: Bool) throws  -> [FfiRejection]
     
+    /**
+     * Drop every local row, the outbox, the cursor and the journal, and return
+     * the sandbox paths the host must delete. The store then keeps a newly
+     * minted client identity, which the next registration uses.
+     *
+     * # Errors
+     *
+     * The store's code when the reset cannot be written.
+     */
     func reset() throws  -> [String]
     
+    /**
+     * The local path for `reference`, downloading the object when the sandbox
+     * does not hold it yet. `None` means the bytes are not on Storage yet. The
+     * reference's watchers then hear its new status on the delivery thread.
+     * The download waits for a `sync` in flight.
+     *
+     * # Errors
+     *
+     * The transfer code when the download fails, and
+     * `ATTACHMENT_PORTS_MISSING` when the handle has no sandbox.
+     */
     func resolveDownload(reference: String) throws  -> String?
     
+    /**
+     * Set the pull cursor without pulling, so a client resumes from a checkpoint
+     * the host already holds.
+     *
+     * # Errors
+     *
+     * The store's code when the cursor cannot be written.
+     */
     func seedCheckpoint(cursor: String) throws 
     
+    /**
+     * Replace the user JWT the remote sends on its next call. `None` clears it.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
+     */
     func setAccessToken(token: String?) throws 
     
+    /**
+     * Set the bucket parameters the object names, on every table bucketed on
+     * that key, leaving the others untouched. This is what a sign-in or a
+     * workspace switch calls.
+     *
+     * A non-empty value that differs from the one the store keeps for its key
+     * replaces the local scope: the next pull re-bootstraps every table and
+     * keeps only the new scope's rows, while queued writes stay.
+     *
+     * # Errors
+     *
+     * `JSON` when `params_json` is not an object, and `BUCKET_UNSET` when a key
+     * is not a configured bucket column.
+     */
     func setBucket(paramsJson: String) throws 
     
     /**
-     * Register a host observer. Events are delivered synchronously on the thread
-     * that produced them, while `apply` / `sync` still hold this handle's lock:
-     * an observer that calls back into the engine deadlocks, so hand the event
-     * to another queue or thread instead (see [`EventObserver`]).
+     * Drop the engine and its store, once the calls it already accepted have
+     * answered. Further typed calls fail `ENGINE_UNAVAILABLE` until `create`
+     * runs again. Named `shutdown` because `UniFFI` Kotlin already uses
+     * `close()` for `AutoCloseable`.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle's lock is poisoned.
+     */
+    func shutdown() throws 
+    
+    /**
+     * Register a host observer and return the id [`Self::unsubscribe`] takes.
+     * Ids never repeat on one handle, across `create` calls too. Events reach
+     * the observer on the handle's delivery thread, in emission order, so
+     * `on_event` may call back into this handle (see [`EventObserver`]).
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
      */
     func subscribe(observer: EventObserver) throws  -> UInt64
     
+    /**
+     * Push the outbox, pull the buckets, and drive the attachment queue, then
+     * hand every attachment watcher its reference's current status.
+     *
+     * # Errors
+     *
+     * Whatever the engine's push or pull reports. A transport failure arrives
+     * as `PERMANENT_TRANSPORT` or `REMOTE`, with the server's message in `msg`.
+     */
     func sync() throws 
     
+    /**
+     * Stop the subscription `subscription_id` names. An unknown id is a no-op.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
+     */
     func unsubscribe(subscriptionId: UInt64) throws 
     
+    /**
+     * Drop the watcher `watch_id` names. An unknown id is a no-op.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
+     */
     func unwatch(watchId: UInt64) throws 
     
+    /**
+     * Delete the Storage object, the sandbox file and the row of every
+     * orphaned attachment, and the cached bytes of every evicted one without
+     * asking Storage. A removal Storage refuses with 401 or 403, or one still
+     * failing once the attachment budget is spent, leaves its row evicted.
+     * Does nothing without a session or on a soft-blocked store, and waits
+     * for a `sync` in flight.
+     *
+     * # Errors
+     *
+     * The store's code when a row cannot be read or written.
+     */
     func vacuum() throws 
     
     /**
-     * Watch one attachment reference. This listener alone receives the current
-     * status right away — registering never re-fires the reference's other
-     * watchers, which only hear real transitions. Every delivery is synchronous
-     * on the calling thread, so a listener must not call back into the engine
-     * (see [`AttachmentListener`]).
+     * Watch one attachment reference and return the id [`Self::unwatch`] takes.
+     * Ids never repeat on one handle, across `create` calls too.
+     *
+     * This listener alone receives the current status right away, so
+     * registering never re-fires the reference's other watchers. After that,
+     * every watcher of the reference receives its status after each `sync`,
+     * and after a `from_file` or a `resolve_download` of that reference. Every
+     * status reaches the listener on the handle's delivery thread, in emission
+     * order, so `on_status` may call back into this handle (see
+     * [`AttachmentListener`]).
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
      */
     func watch(reference: String, listener: AttachmentListener) throws  -> UInt64
     
@@ -1058,7 +1334,7 @@ public protocol KsyncEngineProtocol: AnyObject, Sendable {
 /**
  * Instance-scoped engine handle for Swift/Kotlin (`UniFFI` object).
  */
-open class KsyncEngine: KsyncEngineProtocol, @unchecked Sendable {
+open class KizunaSyncEngine: KizunaSyncEngineProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
 
     /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
@@ -1095,12 +1371,15 @@ open class KsyncEngine: KsyncEngineProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_ksync_ffi_fn_clone_ksyncengine(self.handle, $0) }
+        return try! rustCall { uniffi_kizunasync_ffi_fn_clone_kizunasyncengine(self.handle, $0) }
     }
+    /**
+     * A handle with no engine yet. Call [`Self::create`] before anything else.
+     */
 public convenience init() {
     let handle =
         try! rustCall() {
-    uniffi_ksync_ffi_fn_constructor_ksyncengine_new($0
+    uniffi_kizunasync_ffi_fn_constructor_kizunasyncengine_new($0
     )
 }
     self.init(unsafeFromHandle: handle)
@@ -1112,46 +1391,82 @@ public convenience init() {
             return
         }
 
-        try! rustCall { uniffi_ksync_ffi_fn_free_ksyncengine(handle, $0) }
+        try! rustCall { uniffi_kizunasync_ffi_fn_free_kizunasyncengine(handle, $0) }
     }
 
     
 
     
-open func apply(mutationJson: String)throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_apply(
+    /**
+     * Apply one local mutation and queue it for the next push.
+     *
+     * A mutation against a table whose `conflict_mode` is `hlc` carries the
+     * origin HLC the server resolves the column by: the one the caller put in
+     * `mutation_json`, or a freshly minted stamp. An arrival-mode table carries
+     * none.
+     *
+     * # Errors
+     *
+     * `UNKNOWN_OP` for an op outside insert/update/delete, and whatever the
+     * engine reports for the write itself.
+     */
+open func apply(mutationJson: String)throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_apply(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(mutationJson),$0
     )
 }
 }
     
-open func applyWhere(table: String, op: String, filtersJson: String, columnsJson: String, transformsJson: String, preconditionJson: String)throws  -> [String]  {
-    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_apply_where(
+    /**
+     * Apply one op to every local row the filters select, and return their
+     * primary keys, or with `returning` the rows they name, one JSON object
+     * per element. Empty strings stand for absent `transforms`,
+     * `precondition`, and options.
+     *
+     * `options_json` is `{"max_affected": n, "returning": bool, "cardinality":
+     * "single" | "maybeSingle"}`, every key optional. A write past
+     * `max_affected`, or one whose match count breaks `cardinality`, writes
+     * nothing.
+     *
+     * # Errors
+     *
+     * `UNKNOWN_OP` for an op outside insert/update/delete, `JSON` for a
+     * malformed argument or an unknown option, `LOCAL_CONSTRAINT` for a broken
+     * cap or cardinality, and whatever the engine reports for the write.
+     */
+open func applyWhere(table: String, op: String, filtersJson: String, columnsJson: String, transformsJson: String, preconditionJson: String, optionsJson: String)throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_apply_where(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(table),
         FfiConverterString.lower(op),
         FfiConverterString.lower(filtersJson),
         FfiConverterString.lower(columnsJson),
         FfiConverterString.lower(transformsJson),
-        FfiConverterString.lower(preconditionJson),$0
+        FfiConverterString.lower(preconditionJson),
+        FfiConverterString.lower(optionsJson),$0
     )
 })
 }
     
     /**
-     * One JSON-RPC surface matching `ksync-napi` (`apply`, `sync`, `pull_once`,
+     * One JSON-RPC surface matching `kizunasync-napi` (`apply`, `sync`, `pull_once`,
      * attachment rows, …). Envelope `{ok, value}` / `{ok:false, error}`.
      *
      * `params_json` may carry the embedder's clock (`now` / `now_ms`); it is
-     * pinned for this dispatch only, so both engines stamp the same values from
+     * pinned for this dispatch only, so every bridge stamps the same values from
      * the same request and the typed methods keep stamping with the system
      * clock.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine. A method that fails
+     * answers inside the envelope instead, as `ok:false`.
      */
 open func call(method: String, paramsJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_call(
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_call(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(method),
         FfiConverterString.lower(paramsJson),$0
@@ -1159,37 +1474,100 @@ open func call(method: String, paramsJson: String)throws  -> String  {
 })
 }
     
+    /**
+     * [`Self::call`] without blocking the caller: the future resolves once the
+     * engine thread answers, so a host that must keep its thread free (the
+     * React Native JavaScript thread) awaits it instead.
+     *
+     * # Errors
+     *
+     * The same as [`Self::call`].
+     */
+open func callAsync(method: String, paramsJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_kizunasync_ffi_fn_method_kizunasyncengine_call_async(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(method),FfiConverterString.lower(paramsJson)
+                )
+            },
+            pollFunc: ffi_kizunasync_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_kizunasync_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_kizunasync_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeKizunaSyncFfiError_lift
+        )
+}
+    
+    /**
+     * The current pull cursor and whether the engine is holding writes back,
+     * with the reason it is.
+     *
+     * # Errors
+     *
+     * The store's code when the cursor cannot be read.
+     */
 open func checkpoint()throws  -> FfiCheckpoint  {
-    return try  FfiConverterTypeFfiCheckpoint_lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_checkpoint(
+    return try  FfiConverterTypeFfiCheckpoint_lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_checkpoint(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
     /**
-     * Create / replace this handle's engine from `EngineConfig` JSON.
+     * Create or replace this handle's engine from `EngineConfig` JSON.
+     *
+     * Replacing an engine waits for the calls it already accepted, then closes
+     * it; its subscriptions and watchers end with it.
+     *
+     * # Errors
+     *
+     * `CONFIG_INVALID` when the JSON, the `remote` object, a table's
+     * `conflict_mode` or the attachment root is refused, the store's own code
+     * when the database cannot be opened, and `ENGINE_UNAVAILABLE` when the
+     * runtime or a thread will not start.
      */
-open func create(configJson: String)throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_create(
+open func create(configJson: String)throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_create(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(configJson),$0
     )
 }
 }
     
+    /**
+     * Dismiss one journal entry. `false` means no entry carries that mutation id.
+     *
+     * # Errors
+     *
+     * The store's code when the journal cannot be written.
+     */
 open func dismissRejection(mutationId: String)throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_dismiss_rejection(
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_dismiss_rejection(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(mutationId),$0
     )
 })
 }
     
+    /**
+     * Import a host file into the attachment sandbox, queue its upload, and
+     * return the Storage reference the column now holds. The reference's
+     * watchers then hear its new status on the delivery thread.
+     *
+     * # Errors
+     *
+     * `ATTACHMENT_PORTS_MISSING` when the handle was created without
+     * `attachment_root`, `ATTACHMENT_ROW_GONE` or `ATTACHMENT_OWNER_MISSING`
+     * when the row cannot carry the reference, and the transfer code when the
+     * bytes cannot be read.
+     */
 open func fromFile(table: String, column: String, pk: String, sourcePath: String, mediaType: String?)throws  -> FfiFromFileResult  {
-    return try  FfiConverterTypeFfiFromFileResult_lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_from_file(
+    return try  FfiConverterTypeFfiFromFileResult_lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_from_file(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(table),
         FfiConverterString.lower(column),
@@ -1200,52 +1578,118 @@ open func fromFile(table: String, column: String, pk: String, sourcePath: String
 })
 }
     
+    /**
+     * The current status of `reference`, or `None` when no attachment row
+     * carries it.
+     *
+     * # Errors
+     *
+     * The store's code when the row cannot be read.
+     */
 open func getStatus(reference: String)throws  -> FfiAttachmentStatus?  {
-    return try  FfiConverterOptionTypeFfiAttachmentStatus.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_get_status(
+    return try  FfiConverterOptionTypeFfiAttachmentStatus.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_get_status(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(reference),$0
     )
 })
 }
     
-open func outboxDepth()throws  -> UInt32  {
-    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_outbox_depth(
+    /**
+     * Devtools snapshot of the local command queue: the queued page, the depth,
+     * the last mutation id, the cursor and the client identity. It is the payload
+     * `call("inspect", "{}")` answers with, unwrapped from the envelope, because
+     * the engine's own `inspect` is the one owner of those five fields.
+     *
+     * # Errors
+     *
+     * The code the engine reported inside the envelope, and `JSON` when the
+     * envelope itself cannot be read.
+     */
+open func inspect()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_inspect(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
-open func pullOnce()throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_pull_once(
+    /**
+     * How many mutations are waiting to be pushed. Saturates at [`u32::MAX`].
+     *
+     * # Errors
+     *
+     * The store's code when the count cannot be read.
+     */
+open func outboxDepth()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_outbox_depth(
             self.uniffiCloneHandle(),$0
     )
-}
+})
 }
     
-open func pushOnce()throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_push_once(
+    /**
+     * Run one pull round without pushing.
+     *
+     * # Errors
+     *
+     * Whatever the remote reports. A transport failure arrives as
+     * `PERMANENT_TRANSPORT` or `REMOTE`, with the server's message in `msg`.
+     */
+open func pullOnce()throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_pull_once(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
     /**
-     * Returns query result JSON (array for many, object/null for single/maybeSingle).
+     * Push one outbox batch without pulling.
+     *
+     * # Errors
+     *
+     * Whatever the remote reports. A transport failure arrives as
+     * `PERMANENT_TRANSPORT` or `REMOTE`, with the server's message in `msg`.
+     */
+open func pushOnce()throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_push_once(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Run one query against the local store and return its result as JSON: an
+     * array for `many`, an object or `null` for `single` and `maybeSingle`.
+     *
+     * # Errors
+     *
+     * `LOCAL_UNSUPPORTED` for a plan the local evaluator cannot run,
+     * `LOCAL_CONSTRAINT` when a cardinality is violated, and the store's code
+     * when the read itself fails.
      */
 open func query(reqJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_query(
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_query(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(reqJson),$0
     )
 })
 }
     
+    /**
+     * [`Self::query`] with the table and the plan as separate arguments, for
+     * hosts that build the plan and the table name apart. An empty `plan_json`
+     * is the empty plan.
+     *
+     * # Errors
+     *
+     * The same as [`Self::query`], plus `JSON` for a malformed plan.
+     */
 open func queryTable(table: String, planJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_query_table(
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_query_table(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(table),
         FfiConverterString.lower(planJson),$0
@@ -1253,50 +1697,107 @@ open func queryTable(table: String, planJson: String)throws  -> String  {
 })
 }
     
+    /**
+     * The rejection journal, newest first. `include_dismissed` also returns the
+     * entries the host already dismissed.
+     *
+     * # Errors
+     *
+     * The store's code when the journal cannot be read.
+     */
 open func rejections(includeDismissed: Bool)throws  -> [FfiRejection]  {
-    return try  FfiConverterSequenceTypeFfiRejection.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_rejections(
+    return try  FfiConverterSequenceTypeFfiRejection.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_rejections(
             self.uniffiCloneHandle(),
         FfiConverterBool.lower(includeDismissed),$0
     )
 })
 }
     
+    /**
+     * Drop every local row, the outbox, the cursor and the journal, and return
+     * the sandbox paths the host must delete. The store then keeps a newly
+     * minted client identity, which the next registration uses.
+     *
+     * # Errors
+     *
+     * The store's code when the reset cannot be written.
+     */
 open func reset()throws  -> [String]  {
-    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_reset(
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_reset(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
+    /**
+     * The local path for `reference`, downloading the object when the sandbox
+     * does not hold it yet. `None` means the bytes are not on Storage yet. The
+     * reference's watchers then hear its new status on the delivery thread.
+     * The download waits for a `sync` in flight.
+     *
+     * # Errors
+     *
+     * The transfer code when the download fails, and
+     * `ATTACHMENT_PORTS_MISSING` when the handle has no sandbox.
+     */
 open func resolveDownload(reference: String)throws  -> String?  {
-    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_resolve_download(
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_resolve_download(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(reference),$0
     )
 })
 }
     
-open func seedCheckpoint(cursor: String)throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_seed_checkpoint(
+    /**
+     * Set the pull cursor without pulling, so a client resumes from a checkpoint
+     * the host already holds.
+     *
+     * # Errors
+     *
+     * The store's code when the cursor cannot be written.
+     */
+open func seedCheckpoint(cursor: String)throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_seed_checkpoint(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(cursor),$0
     )
 }
 }
     
-open func setAccessToken(token: String?)throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_set_access_token(
+    /**
+     * Replace the user JWT the remote sends on its next call. `None` clears it.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
+     */
+open func setAccessToken(token: String?)throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_set_access_token(
             self.uniffiCloneHandle(),
         FfiConverterOptionString.lower(token),$0
     )
 }
 }
     
-open func setBucket(paramsJson: String)throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_set_bucket(
+    /**
+     * Set the bucket parameters the object names, on every table bucketed on
+     * that key, leaving the others untouched. This is what a sign-in or a
+     * workspace switch calls.
+     *
+     * A non-empty value that differs from the one the store keeps for its key
+     * replaces the local scope: the next pull re-bootstraps every table and
+     * keeps only the new scope's rows, while queued writes stay.
+     *
+     * # Errors
+     *
+     * `JSON` when `params_json` is not an object, and `BUCKET_UNSET` when a key
+     * is not a configured bucket column.
+     */
+open func setBucket(paramsJson: String)throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_set_bucket(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(paramsJson),$0
     )
@@ -1304,60 +1805,125 @@ open func setBucket(paramsJson: String)throws   {try rustCallWithError(FfiConver
 }
     
     /**
-     * Register a host observer. Events are delivered synchronously on the thread
-     * that produced them, while `apply` / `sync` still hold this handle's lock:
-     * an observer that calls back into the engine deadlocks, so hand the event
-     * to another queue or thread instead (see [`EventObserver`]).
+     * Drop the engine and its store, once the calls it already accepted have
+     * answered. Further typed calls fail `ENGINE_UNAVAILABLE` until `create`
+     * runs again. Named `shutdown` because `UniFFI` Kotlin already uses
+     * `close()` for `AutoCloseable`.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle's lock is poisoned.
      */
-open func subscribe(observer: EventObserver)throws  -> UInt64  {
-    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_subscribe(
-            self.uniffiCloneHandle(),
-        FfiConverterTypeEventObserver_lower(observer),$0
-    )
-})
-}
-    
-open func sync()throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_sync(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-open func unsubscribe(subscriptionId: UInt64)throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_unsubscribe(
-            self.uniffiCloneHandle(),
-        FfiConverterUInt64.lower(subscriptionId),$0
-    )
-}
-}
-    
-open func unwatch(watchId: UInt64)throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_unwatch(
-            self.uniffiCloneHandle(),
-        FfiConverterUInt64.lower(watchId),$0
-    )
-}
-}
-    
-open func vacuum()throws   {try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_vacuum(
+open func shutdown()throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_shutdown(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
     /**
-     * Watch one attachment reference. This listener alone receives the current
-     * status right away — registering never re-fires the reference's other
-     * watchers, which only hear real transitions. Every delivery is synchronous
-     * on the calling thread, so a listener must not call back into the engine
-     * (see [`AttachmentListener`]).
+     * Register a host observer and return the id [`Self::unsubscribe`] takes.
+     * Ids never repeat on one handle, across `create` calls too. Events reach
+     * the observer on the handle's delivery thread, in emission order, so
+     * `on_event` may call back into this handle (see [`EventObserver`]).
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
+     */
+open func subscribe(observer: EventObserver)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_subscribe(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeEventObserver_lower(observer),$0
+    )
+})
+}
+    
+    /**
+     * Push the outbox, pull the buckets, and drive the attachment queue, then
+     * hand every attachment watcher its reference's current status.
+     *
+     * # Errors
+     *
+     * Whatever the engine's push or pull reports. A transport failure arrives
+     * as `PERMANENT_TRANSPORT` or `REMOTE`, with the server's message in `msg`.
+     */
+open func sync()throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_sync(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Stop the subscription `subscription_id` names. An unknown id is a no-op.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
+     */
+open func unsubscribe(subscriptionId: UInt64)throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_unsubscribe(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(subscriptionId),$0
+    )
+}
+}
+    
+    /**
+     * Drop the watcher `watch_id` names. An unknown id is a no-op.
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
+     */
+open func unwatch(watchId: UInt64)throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_unwatch(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(watchId),$0
+    )
+}
+}
+    
+    /**
+     * Delete the Storage object, the sandbox file and the row of every
+     * orphaned attachment, and the cached bytes of every evicted one without
+     * asking Storage. A removal Storage refuses with 401 or 403, or one still
+     * failing once the attachment budget is spent, leaves its row evicted.
+     * Does nothing without a session or on a soft-blocked store, and waits
+     * for a `sync` in flight.
+     *
+     * # Errors
+     *
+     * The store's code when a row cannot be read or written.
+     */
+open func vacuum()throws   {try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_vacuum(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Watch one attachment reference and return the id [`Self::unwatch`] takes.
+     * Ids never repeat on one handle, across `create` calls too.
+     *
+     * This listener alone receives the current status right away, so
+     * registering never re-fires the reference's other watchers. After that,
+     * every watcher of the reference receives its status after each `sync`,
+     * and after a `from_file` or a `resolve_download` of that reference. Every
+     * status reaches the listener on the handle's delivery thread, in emission
+     * order, so `on_status` may call back into this handle (see
+     * [`AttachmentListener`]).
+     *
+     * # Errors
+     *
+     * `ENGINE_UNAVAILABLE` when this handle has no engine.
      */
 open func watch(reference: String, listener: AttachmentListener)throws  -> UInt64  {
-    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeKsyncFfiError_lift) {
-    uniffi_ksync_ffi_fn_method_ksyncengine_watch(
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeKizunaSyncFfiError_lift) {
+    uniffi_kizunasync_ffi_fn_method_kizunasyncengine_watch(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(reference),
         FfiConverterTypeAttachmentListener_lower(listener),$0
@@ -1373,24 +1939,24 @@ open func watch(reference: String, listener: AttachmentListener)throws  -> UInt6
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeKsyncEngine: FfiConverter {
+public struct FfiConverterTypeKizunaSyncEngine: FfiConverter {
     typealias FfiType = UInt64
-    typealias SwiftType = KsyncEngine
+    typealias SwiftType = KizunaSyncEngine
 
-    public static func lift(_ handle: UInt64) throws -> KsyncEngine {
-        return KsyncEngine(unsafeFromHandle: handle)
+    public static func lift(_ handle: UInt64) throws -> KizunaSyncEngine {
+        return KizunaSyncEngine(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: KsyncEngine) -> UInt64 {
+    public static func lower(_ value: KizunaSyncEngine) -> UInt64 {
         return value.uniffiCloneHandle()
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KsyncEngine {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KizunaSyncEngine {
         let handle: UInt64 = try readInt(&buf)
         return try lift(handle)
     }
 
-    public static func write(_ value: KsyncEngine, into buf: inout [UInt8]) {
+    public static func write(_ value: KizunaSyncEngine, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -1399,33 +1965,84 @@ public struct FfiConverterTypeKsyncEngine: FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeKsyncEngine_lift(_ handle: UInt64) throws -> KsyncEngine {
-    return try FfiConverterTypeKsyncEngine.lift(handle)
+public func FfiConverterTypeKizunaSyncEngine_lift(_ handle: UInt64) throws -> KizunaSyncEngine {
+    return try FfiConverterTypeKizunaSyncEngine.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeKsyncEngine_lower(_ value: KsyncEngine) -> UInt64 {
-    return FfiConverterTypeKsyncEngine.lower(value)
+public func FfiConverterTypeKizunaSyncEngine_lower(_ value: KizunaSyncEngine) -> UInt64 {
+    return FfiConverterTypeKizunaSyncEngine.lower(value)
 }
 
 
 
 
+/**
+ * Where one attachment reference stands right now.
+ */
 public struct FfiAttachmentStatus: Equatable, Hashable {
+    /**
+     * `queued`, `uploading`, `downloading`, `synced`, `failed`, `orphaned`,
+     * `evicted` (this device dropped its copy and keeps the object in
+     * Storage), or `missing` when no row carries the reference.
+     */
     public var state: String
+    /**
+     * Bytes transferred so far.
+     */
     public var progress: Int64
+    /**
+     * The last failure's message, when there was one.
+     */
     public var error: String?
+    /**
+     * The sandbox path holding the bytes, when they are local.
+     */
     public var localPath: String?
+    /**
+     * Whether the transfer budget stopped this reference for good. A `failed`
+     * row is retried by the next drive; a permanent one waits for the app.
+     */
+    public var permanent: Bool
+    /**
+     * The engine catalog code of the last recorded failure, `None` while the
+     * row records none.
+     */
+    public var errorCode: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(state: String, progress: Int64, error: String?, localPath: String?) {
+    public init(
+        /**
+         * `queued`, `uploading`, `downloading`, `synced`, `failed`, `orphaned`,
+         * `evicted` (this device dropped its copy and keeps the object in
+         * Storage), or `missing` when no row carries the reference.
+         */state: String, 
+        /**
+         * Bytes transferred so far.
+         */progress: Int64, 
+        /**
+         * The last failure's message, when there was one.
+         */error: String?, 
+        /**
+         * The sandbox path holding the bytes, when they are local.
+         */localPath: String?, 
+        /**
+         * Whether the transfer budget stopped this reference for good. A `failed`
+         * row is retried by the next drive; a permanent one waits for the app.
+         */permanent: Bool, 
+        /**
+         * The engine catalog code of the last recorded failure, `None` while the
+         * row records none.
+         */errorCode: String?) {
         self.state = state
         self.progress = progress
         self.error = error
         self.localPath = localPath
+        self.permanent = permanent
+        self.errorCode = errorCode
     }
 
     
@@ -1447,7 +2064,9 @@ public struct FfiConverterTypeFfiAttachmentStatus: FfiConverterRustBuffer {
                 state: FfiConverterString.read(from: &buf), 
                 progress: FfiConverterInt64.read(from: &buf), 
                 error: FfiConverterOptionString.read(from: &buf), 
-                localPath: FfiConverterOptionString.read(from: &buf)
+                localPath: FfiConverterOptionString.read(from: &buf), 
+                permanent: FfiConverterBool.read(from: &buf), 
+                errorCode: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -1456,6 +2075,8 @@ public struct FfiConverterTypeFfiAttachmentStatus: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.progress, into: &buf)
         FfiConverterOptionString.write(value.error, into: &buf)
         FfiConverterOptionString.write(value.localPath, into: &buf)
+        FfiConverterBool.write(value.permanent, into: &buf)
+        FfiConverterOptionString.write(value.errorCode, into: &buf)
     }
 }
 
@@ -1475,15 +2096,44 @@ public func FfiConverterTypeFfiAttachmentStatus_lower(_ value: FfiAttachmentStat
 }
 
 
+/**
+ * The pull cursor and whether the engine is holding writes back.
+ */
 public struct FfiCheckpoint: Equatable, Hashable {
+    /**
+     * The opaque cursor token the next pull sends.
+     */
     public var cursor: String
+    /**
+     * `true` while the engine refuses new writes until the host resolves the
+     * rejection journal.
+     */
     public var softBlocked: Bool
+    /**
+     * Why the engine is soft-blocked: `reset_required` when the server's schema
+     * gate asked for a reset, `identity_changed` when a token named another
+     * user than the one the store belongs to. `None` while it is not.
+     */
+    public var softBlockReason: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(cursor: String, softBlocked: Bool) {
+    public init(
+        /**
+         * The opaque cursor token the next pull sends.
+         */cursor: String, 
+        /**
+         * `true` while the engine refuses new writes until the host resolves the
+         * rejection journal.
+         */softBlocked: Bool, 
+        /**
+         * Why the engine is soft-blocked: `reset_required` when the server's schema
+         * gate asked for a reset, `identity_changed` when a token named another
+         * user than the one the store belongs to. `None` while it is not.
+         */softBlockReason: String?) {
         self.cursor = cursor
         self.softBlocked = softBlocked
+        self.softBlockReason = softBlockReason
     }
 
     
@@ -1503,13 +2153,15 @@ public struct FfiConverterTypeFfiCheckpoint: FfiConverterRustBuffer {
         return
             try FfiCheckpoint(
                 cursor: FfiConverterString.read(from: &buf), 
-                softBlocked: FfiConverterBool.read(from: &buf)
+                softBlocked: FfiConverterBool.read(from: &buf), 
+                softBlockReason: FfiConverterOptionString.read(from: &buf)
         )
     }
 
     public static func write(_ value: FfiCheckpoint, into buf: inout [UInt8]) {
         FfiConverterString.write(value.cursor, into: &buf)
         FfiConverterBool.write(value.softBlocked, into: &buf)
+        FfiConverterOptionString.write(value.softBlockReason, into: &buf)
     }
 }
 
@@ -1529,16 +2181,50 @@ public func FfiConverterTypeFfiCheckpoint_lower(_ value: FfiCheckpoint) -> RustB
 }
 
 
+/**
+ * What importing a host file produced: the Storage reference the column now
+ * holds, plus the sandbox copy's metadata.
+ */
 public struct FfiFromFileResult: Equatable, Hashable {
+    /**
+     * The Storage object key the row's column carries.
+     */
     public var reference: String
+    /**
+     * The content hash the confirm step records.
+     */
     public var sha256: String
+    /**
+     * The byte length of the imported file.
+     */
     public var size: Int64
+    /**
+     * The media type the upload declares.
+     */
     public var mediaType: String
+    /**
+     * The sandbox path holding the bytes.
+     */
     public var localPath: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(reference: String, sha256: String, size: Int64, mediaType: String, localPath: String) {
+    public init(
+        /**
+         * The Storage object key the row's column carries.
+         */reference: String, 
+        /**
+         * The content hash the confirm step records.
+         */sha256: String, 
+        /**
+         * The byte length of the imported file.
+         */size: Int64, 
+        /**
+         * The media type the upload declares.
+         */mediaType: String, 
+        /**
+         * The sandbox path holding the bytes.
+         */localPath: String) {
         self.reference = reference
         self.sha256 = sha256
         self.size = size
@@ -1595,20 +2281,79 @@ public func FfiConverterTypeFfiFromFileResult_lower(_ value: FfiFromFileResult) 
 }
 
 
+/**
+ * One entry of the rejection journal: a local write the server refused.
+ */
 public struct FfiRejection: Equatable, Hashable {
+    /**
+     * The refused mutation.
+     */
     public var mutationId: String
+    /**
+     * The table it targeted.
+     */
     public var table: String
+    /**
+     * The row it targeted.
+     */
     public var pk: String
+    /**
+     * How the server refused it (a verdict, an abort).
+     */
     public var kind: String
+    /**
+     * The server's reason code.
+     */
     public var reason: String
+    /**
+     * The columns the write would have changed.
+     */
     public var changedColumns: [String]
+    /**
+     * The authoritative row as JSON, or an empty string when the server sent
+     * none.
+     */
     public var serverRowJson: String
+    /**
+     * When the journal recorded it, in epoch milliseconds.
+     */
     public var at: Int64
+    /**
+     * `true` once the host dismissed it.
+     */
     public var dismissed: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(mutationId: String, table: String, pk: String, kind: String, reason: String, changedColumns: [String], serverRowJson: String, at: Int64, dismissed: Bool) {
+    public init(
+        /**
+         * The refused mutation.
+         */mutationId: String, 
+        /**
+         * The table it targeted.
+         */table: String, 
+        /**
+         * The row it targeted.
+         */pk: String, 
+        /**
+         * How the server refused it (a verdict, an abort).
+         */kind: String, 
+        /**
+         * The server's reason code.
+         */reason: String, 
+        /**
+         * The columns the write would have changed.
+         */changedColumns: [String], 
+        /**
+         * The authoritative row as JSON, or an empty string when the server sent
+         * none.
+         */serverRowJson: String, 
+        /**
+         * When the journal recorded it, in epoch milliseconds.
+         */at: Int64, 
+        /**
+         * `true` once the host dismissed it.
+         */dismissed: Bool) {
         self.mutationId = mutationId
         self.table = table
         self.pk = pk
@@ -1685,18 +2430,87 @@ public func FfiConverterTypeFfiRejection_lower(_ value: FfiRejection) -> RustBuf
 
 public enum FfiEngineEvent: Equatable, Hashable {
     
+    /**
+     * The local store changed; re-read what is on screen.
+     */
     case localChanged
-    case mutationRejected(mutationId: String, reason: String
+    /**
+     * The server refused one mutation, which is now in the journal.
+     */
+    case mutationRejected(
+        /**
+         * The refused mutation.
+         */mutationId: String, 
+        /**
+         * The server's reason code.
+         */reason: String
     )
-    case queueDepth(depth: UInt32
+    /**
+     * The outbox depth after a push or an apply.
+     */
+    case queueDepth(
+        /**
+         * How many mutations are still queued.
+         */depth: UInt32
     )
-    case resetRequired
+    /**
+     * The engine soft-blocked until the host resets the store.
+     */
+    case resetRequired(
+        /**
+         * `reset_required` when the server's schema gate asked for a reset,
+         * `identity_changed` when a token named another user than the one the
+         * store belongs to.
+         */reason: String?
+    )
+    /**
+     * The cursor is older than the server's retention window.
+     */
     case checkpointExpired
-    case batchAborted(offenderMutationId: String, reason: String
+    /**
+     * An atomic batch was refused whole.
+     */
+    case batchAborted(
+        /**
+         * The member the server blamed.
+         */offenderMutationId: String, 
+        /**
+         * The server's reason code.
+         */reason: String
     )
-    case deadLetter(mutationId: String, reason: String
+    /**
+     * A mutation exhausted the retry budget and was dropped.
+     */
+    case deadLetter(
+        /**
+         * The dropped mutation.
+         */mutationId: String, 
+        /**
+         * Why it was dropped.
+         */reason: String
     )
-    case columnOverwritten(table: String, pk: String, column: String, loserValueJson: String, winnerMutationId: String, conflictMode: String
+    /**
+     * A concurrent write won one column and the local value was overwritten.
+     */
+    case columnOverwritten(
+        /**
+         * The row's table.
+         */table: String, 
+        /**
+         * The row's primary key.
+         */pk: String, 
+        /**
+         * The column that changed owner.
+         */column: String, 
+        /**
+         * The value that lost, as JSON.
+         */loserValueJson: String, 
+        /**
+         * The mutation that won.
+         */winnerMutationId: String, 
+        /**
+         * The conflict rule that decided it.
+         */conflictMode: String
     )
 
 
@@ -1727,7 +2541,8 @@ public struct FfiConverterTypeFfiEngineEvent: FfiConverterRustBuffer {
         case 3: return .queueDepth(depth: try FfiConverterUInt32.read(from: &buf)
         )
         
-        case 4: return .resetRequired
+        case 4: return .resetRequired(reason: try FfiConverterOptionString.read(from: &buf)
+        )
         
         case 5: return .checkpointExpired
         
@@ -1763,9 +2578,10 @@ public struct FfiConverterTypeFfiEngineEvent: FfiConverterRustBuffer {
             FfiConverterUInt32.write(depth, into: &buf)
             
         
-        case .resetRequired:
+        case let .resetRequired(reason):
             writeInt(&buf, Int32(4))
-        
+            FfiConverterOptionString.write(reason, into: &buf)
+            
         
         case .checkpointExpired:
             writeInt(&buf, Int32(5))
@@ -1813,11 +2629,25 @@ public func FfiConverterTypeFfiEngineEvent_lower(_ value: FfiEngineEvent) -> Rus
 
 
 
-public enum KsyncFfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+/**
+ * The one error every exported method throws. `code` is a
+ * [`kizunasync_engine::error_catalog`] member, so a host switches on it and never on
+ * `msg`.
+ */
+public enum KizunaSyncFfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
-    case Engine(code: String, msg: String
+    /**
+     * An engine fault, carrying its catalog code and its message.
+     */
+    case Engine(
+        /**
+         * The catalog code, stable across every binding.
+         */code: String, 
+        /**
+         * The human-readable detail. Never classify on it.
+         */msg: String
     )
 
     
@@ -1832,16 +2662,16 @@ public enum KsyncFfiError: Swift.Error, Equatable, Hashable, Foundation.Localize
 }
 
 #if compiler(>=6)
-extension KsyncFfiError: Sendable {}
+extension KizunaSyncFfiError: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeKsyncFfiError: FfiConverterRustBuffer {
-    typealias SwiftType = KsyncFfiError
+public struct FfiConverterTypeKizunaSyncFfiError: FfiConverterRustBuffer {
+    typealias SwiftType = KizunaSyncFfiError
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KsyncFfiError {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KizunaSyncFfiError {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
@@ -1857,7 +2687,7 @@ public struct FfiConverterTypeKsyncFfiError: FfiConverterRustBuffer {
         }
     }
 
-    public static func write(_ value: KsyncFfiError, into buf: inout [UInt8]) {
+    public static func write(_ value: KizunaSyncFfiError, into buf: inout [UInt8]) {
         switch value {
 
         
@@ -1877,15 +2707,15 @@ public struct FfiConverterTypeKsyncFfiError: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeKsyncFfiError_lift(_ buf: RustBuffer) throws -> KsyncFfiError {
-    return try FfiConverterTypeKsyncFfiError.lift(buf)
+public func FfiConverterTypeKizunaSyncFfiError_lift(_ buf: RustBuffer) throws -> KizunaSyncFfiError {
+    return try FfiConverterTypeKizunaSyncFfiError.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeKsyncFfiError_lower(_ value: KsyncFfiError) -> RustBuffer {
-    return FfiConverterTypeKsyncFfiError.lower(value)
+public func FfiConverterTypeKizunaSyncFfiError_lower(_ value: KizunaSyncFfiError) -> RustBuffer {
+    return FfiConverterTypeKizunaSyncFfiError.lower(value)
 }
 
 #if swift(>=5.8)
@@ -1985,6 +2815,54 @@ fileprivate struct FfiConverterSequenceTypeFfiRejection: FfiConverterRustBuffer 
         return seq
     }
 }
+private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
+private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
+
+fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
+
+fileprivate func uniffiRustCallAsync<F, T>(
+    rustFutureFunc: () -> UInt64,
+    pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
+    completeFunc: (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
+    freeFunc: (UInt64) -> (),
+    liftFunc: (F) throws -> T,
+    errorHandler: ((RustBuffer) throws -> Swift.Error)?
+) async throws -> T {
+    // Make sure to call the ensure init function since future creation doesn't have a
+    // RustCallStatus param, so doesn't use makeRustCall()
+    uniffiEnsureKizunasyncFfiInitialized()
+    let rustFuture = rustFutureFunc()
+    defer {
+        freeFunc(rustFuture)
+    }
+    var pollResult: Int8;
+    repeat {
+        pollResult = await withUnsafeContinuation {
+            pollFunc(
+                rustFuture,
+                { handle, pollResult in
+                    uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult)
+                },
+                uniffiContinuationHandleMap.insert(obj: $0)
+            )
+        }
+    } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
+
+    return try liftFunc(makeRustCall(
+        { completeFunc(rustFuture, $0) },
+        errorHandler: errorHandler
+    ))
+}
+
+// Callback handlers for an async calls.  These are invoked by Rust when the future is ready.  They
+// lift the return value or error and resume the suspended function.
+fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: Int8) {
+    if let continuation = try? uniffiContinuationHandleMap.remove(handle: handle) {
+        continuation.resume(returning: pollResult)
+    } else {
+        print("uniffiFutureContinuationCallback invalid handle")
+    }
+}
 
 private enum InitializationResult {
     case ok
@@ -1997,92 +2875,101 @@ private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
     let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
-    let scaffolding_contract_version = ffi_ksync_ffi_uniffi_contract_version()
+    let scaffolding_contract_version = ffi_kizunasync_ffi_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_apply() != 29735) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_apply() != 48331) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_apply_where() != 60697) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_apply_where() != 46702) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_call() != 17021) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_call() != 24654) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_checkpoint() != 63998) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_call_async() != 45658) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_create() != 17921) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_checkpoint() != 14623) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_dismiss_rejection() != 13695) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_create() != 30746) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_from_file() != 40065) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_dismiss_rejection() != 64367) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_get_status() != 47067) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_from_file() != 1634) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_outbox_depth() != 15502) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_get_status() != 41288) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_pull_once() != 52330) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_inspect() != 27968) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_push_once() != 64419) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_outbox_depth() != 7789) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_query() != 29676) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_pull_once() != 14150) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_query_table() != 23733) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_push_once() != 41162) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_rejections() != 10798) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_query() != 30822) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_reset() != 30619) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_query_table() != 24051) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_resolve_download() != 31053) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_rejections() != 33437) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_seed_checkpoint() != 28750) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_reset() != 55520) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_set_access_token() != 35894) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_resolve_download() != 29902) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_set_bucket() != 10403) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_seed_checkpoint() != 9922) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_subscribe() != 12996) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_set_access_token() != 63506) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_sync() != 42902) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_set_bucket() != 65396) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_unsubscribe() != 12319) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_shutdown() != 3519) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_unwatch() != 61961) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_subscribe() != 28485) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_vacuum() != 33759) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_sync() != 34536) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_ksyncengine_watch() != 31730) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_unsubscribe() != 25531) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_attachmentlistener_on_status() != 14611) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_unwatch() != 40869) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_method_eventobserver_on_event() != 22727) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_vacuum() != 20890) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ksync_ffi_checksum_constructor_ksyncengine_new() != 31215) {
+    if (uniffi_kizunasync_ffi_checksum_method_kizunasyncengine_watch() != 24601) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_kizunasync_ffi_checksum_method_attachmentlistener_on_status() != 49540) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_kizunasync_ffi_checksum_method_eventobserver_on_event() != 23643) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_kizunasync_ffi_checksum_constructor_kizunasyncengine_new() != 57304) {
         return InitializationResult.apiChecksumMismatch
     }
 
@@ -2093,7 +2980,7 @@ private let initializationResult: InitializationResult = {
 
 // Make the ensure init function public so that other modules which have external type references to
 // our types can call it.
-public func uniffiEnsureKsyncFfiInitialized() {
+public func uniffiEnsureKizunasyncFfiInitialized() {
     switch initializationResult {
     case .ok:
         break

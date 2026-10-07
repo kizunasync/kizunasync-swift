@@ -2,26 +2,28 @@
 import PackageDescription
 
 let package = Package(
-  name: "ksync-swift",
+  name: "kizunasync-swift",
   platforms: [.iOS(.v16), .macOS(.v13)],
   products: [
-    .library(name: "Ksync", targets: ["Ksync"]),
+    .library(name: "KizunaSync", targets: ["KizunaSync"]),
+    // The engine binary alone, which @kizunasync/rn-uniffi links. Apps depend on KizunaSync.
+    .library(name: "KizunaSyncEngine", targets: ["KizunaSyncFfiRust"]),
   ],
   targets: [
     .binaryTarget(
-      name: "KsyncFfiRust",
-      url: "https://github.com/kizunasync/kizunasync/releases/download/v0.1.0/KsyncFfi.xcframework.zip",
-      checksum: "e1159ef2a38d1378ce9b8487ac78f6fbc94c7f898573ca0146406b2d4feef0c6"
+      name: "KizunaSyncFfiRust",
+      url: "https://github.com/kizunasync/kizunasync/releases/download/v0.2.6-alpha.3/KizunaSyncFfi.xcframework.zip",
+      checksum: "f2f7c481927ee14e585b9dc91228fb8f0f8f8bd4bd0861d3766944c65638e5cb"
     ),
     .target(
-      name: "KsyncFfi",
-      dependencies: ["KsyncFfiRust"],
-      path: "Sources/KsyncFfi"
+      name: "KizunaSyncFfi",
+      dependencies: ["KizunaSyncFfiRust"],
+      path: "Sources/KizunaSyncFfi"
     ),
     .target(
-      name: "Ksync",
-      dependencies: ["KsyncFfi"],
-      path: "Sources/Ksync"
+      name: "KizunaSync",
+      dependencies: ["KizunaSyncFfi"],
+      path: "Sources/KizunaSync"
     ),
   ]
 )
